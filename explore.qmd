@@ -1,0 +1,744 @@
+---
+title: "Sprzedaż ze względu na warunki pogodowe i wojenne"
+ubtitle: "Projekt z zakresu analizy danych"
+lang: pl
+author:
+- Andrii Yanishevskyi
+- Aleksey Myshko
+format: html
+code-fold: true
+lightbox: true
+toc: true
+embed-resources: true
+execute:
+  echo: false
+---
+
+$\newcommand{\unit}[1]{\,\mathrm{#1}}$
+
+```{r}
+#| echo: false
+#| warning: false
+library(equatiomatic)
+library(formatdown)
+library(kableExtra)
+library(tidyverse)
+```
+
+# Wstęp
+
+## Idea
+
+Projekt ten ma na celu zbadanie sprzedaży w dwóch sklepach artykułów
+gospodarstwa domowego zlokalizowanych w Kijowie w latach 2022--2025. Mając też
+dane o pogodzie, alarmach powietrznych i ostrzałach w tej miejscowości w danym
+okresie celem jest zbadanie ukrytych związków pomiędzy tymi cechami.
+
+## Cele
+
+Zbadać związki w rozkładzie dziennego przychodu oraz znaleźć zależności w
+strukturze ostrzałów, a konkretnie mamy wstępne hipotezy:
+
+- Dzienny przychód z opłat kartą jest większy niż z opłat gotówką
+- Sprzedaż zależy od dnia tygodnia i pory dnia (rano, dzień, wieczór)
+- Sprzedaż jest skorelowana z pewnymi czynnikami pogodowymi i intensywnością
+  ostrzałów
+- Długość alarmów powietrznych zależy od pogody
+- Intensywność ostrzałów (wyliczona z liczby rannych i zabitych) zależy od
+  długości alarmów bezpośrednio i pośrednio przez warunki pogodowe
+
+## Dane
+
+### Sprzedaż
+
+Dane z obu sklepów zostały wyeksportowane z systemu
+[Checkbox](https://checkbox.ua/)
+
+Zakres dostępnych danych transakcyjnych ze sklepów:
+
+- sklep `A` w latach 2022-2025
+- sklep `B` jedynie w 2025 roku
+
+### Pogoda
+
+Skorzystano z otwartego API serwisu [Open Meteo](https://open-meteo.com/).
+Pobrano dane odpowiednich okresów zgodnie z lokalizacją każdego ze sklepów co
+do:
+
+- Temperatury
+- Widoczności
+- Opadów
+- Wilgotności
+- Ciśnienia
+
+Po połączeniu dane wyglądają tak:
+
+```{r}
+#| echo: false
+load("rdata/sales_bazhana_weather.RData")
+df2 <- df
+load("rdata/sales_borysp_weather.RData")
+df_full <- df
+df <- df %>%
+  filter(year(datetime) == 2024)
+kable(head(df, 5))
+```
+
+Zmienne ze sklepu:
+
+- `datetime` --- data i czas wystawienia paragonu
+- `payment` --- typ płatności -- karta lub gotówka
+- `total` --- kwota łączna paragonu, UAH
+
+Zmienne pogodowe w lokalizacji sklepu na początku godziny transakcji:
+
+- `temperature_2m` --- temperatura na wysokości $2 \unit{m}$, &deg;C
+- `precipitation` --- opady $\unit{mm}$
+- `visibility` --- widoczność $\unit{m}$
+
+### Alarmy
+Zeskrapowano ze strony [kyiv.digital](https://kyiv.digital/storage/air-alert/stats.html).
+Następnie dla każdego dnia obliczono długość całkowitą alarmów -- `length`($\unit{h}$). Dane
+przedstawiono w tabeli:
+
+```{r}
+#| echo: false
+load("rdata/alarms.RData")
+
+alarms_duration <- alarms %>%
+  mutate(
+    # create sequence of all days touched by the event
+    day = map2(start, stop, ~ seq.Date(as.Date(.x), as.Date(.y), by = "day"))
+  ) %>%
+  tidyr::unnest(day) %>%
+  mutate(
+    # compute the boundaries of each daily segment
+    seg_start = pmax(start, as.POSIXct(day)),
+    seg_end = pmin(stop, as.POSIXct(day) + days(1)),
+    duration_hours = as.numeric(difftime(seg_end, seg_start, units = "hours"))
+  ) %>%
+  select(day, duration_hours) %>%
+  group_by(day) %>%
+  summarise(length = sum(duration_hours)) %>%
+  ungroup()
+
+kable(head(alarms, 5))
+```
+
+### Ostrzały
+
+Zeskrapowano z [tabeli w artykule na Wikipedii](https://uk.wikipedia.org/wiki/%D0%9E%D0%B1%D1%81%D1%82%D1%80%D1%96%D0%BB%D0%B8_%D0%9A%D0%B8%D1%94%D0%B2%D0%B0#2024_%D1%80%D1%96%D0%BA). Po czyszczeniu mamy zbiór danych:
+
+```{r}
+#| echo: false
+load("rdata/shellings.RData")
+
+shellings <- shellings %>%
+  group_by(DateTime) %>%
+  summarise(Injured = max(Injured), Deaths = max(Deaths), count = n()) %>%
+  group_by(date = as.Date(DateTime)) %>%
+  summarise(Injured = sum(Injured), Deaths = sum(Deaths), count = sum(count)) %>%
+  na.omit()
+
+kable(head(shellings, 5))
+```
+
+gdzie:
+
+- `Injured` --- liczba osób rannych w wyniku ostrzałów danego dnia
+- `Deaths` --- liczba osób zabitych w wyniku ostrzałów danego dnia
+- `count` --- liczba lokalizacji przylotów
+
+```{r}
+#| include: false
+
+df_shellings_daily <- df %>%
+  rowwise() %>%
+  mutate(alarm = any(datetime >= alarms$start & datetime <= alarms$stop)) %>%
+  ungroup() %>%
+  group_by(date = as.Date(datetime)) %>%
+  summarise(
+    temperature_2m = mean(temperature_2m),
+    diff = difftime(max(datetime), min(datetime), unit = "mins"),
+    total = sum(total),
+    total.weight = total / ifelse(as.numeric(diff) != 0, as.numeric(diff), 1),
+    precipitation = sum(precipitation),
+    visibility = mean(visibility),
+    relative_humidity_2m = mean(relative_humidity_2m),
+    surface_pressure = mean(surface_pressure),
+    alarms_mean = mean(alarm)
+  ) %>%
+  left_join(., shellings) %>%
+  left_join(., alarms_duration, by = join_by(date == day)) %>%
+  mutate(across(everything(), ~ replace_na(., 0)),
+    weekday = factor(wday(date, week_start = 1))
+  )
+
+sum(is.na(df_shellings_daily))
+
+df2_shellings_daily <- df2 %>%
+  rowwise() %>%
+  mutate(alarm = any(datetime >= alarms$start & datetime <= alarms$stop)) %>%
+  ungroup() %>%
+  group_by(date = as.Date(datetime)) %>%
+  summarise(
+    temperature_2m = mean(temperature_2m),
+    diff = difftime(max(datetime), min(datetime), unit = "mins"),
+    total = sum(total),
+    total.weight = total / ifelse(as.numeric(diff) != 0, as.numeric(diff), 1),
+    precipitation = sum(precipitation),
+    visibility = mean(visibility),
+    relative_humidity_2m = mean(relative_humidity_2m),
+    surface_pressure = mean(surface_pressure),
+    alarm = mean(alarm)
+  ) %>%
+  left_join(., shellings) %>%
+  left_join(., alarms_duration, by = join_by(date == day)) %>%
+  mutate(across(everything(), ~ replace_na(., 0)),
+    weekday = factor(wday(date, week_start = 1))
+  )
+sum(is.na(df_shellings_daily))
+
+```
+
+# Wizualizacje
+
+## Miesiące
+
+Zobaczmy najpierw czy istnieje trend co do dnia pory roku, a właściwie miesiąca:
+
+```{r}
+#| warning: false
+df_full_by_day <- df_full %>%
+  group_by(date = as.Date(datetime)) %>%
+  summarise(total_sum = sum(total)) %>%
+  mutate(
+    year = factor(year(date)),
+    month = factor(month(date)),
+    yday = yday(date)
+  )
+
+ggplot(df_full_by_day) +
+  geom_boxplot(aes(x = year, fill = month, y = total_sum)) +
+  theme_light() +
+  labs(
+    x = "Rok",
+    y = "Dzienny przychód",
+    fill = "Miesiąc",
+    title = "Paragony w różnych latach w ciągu każdego miesiąca"
+  )
+```
+
+Obserwujemy wyraźną różnicę, zwłaszcza w roku 2024, pomiędzy latem a innymi
+porami roku. Właśnie dlatego, a też dlatego, że dane o ostrzałach są pełne tylko
+z tego okresu, skupimy się na analizie danych ze sklepu `A` w roku 2024.
+
+### Dzień tygodnia
+
+Sprawdźmy rozkład przychodu w zależności od dnia tygodnia (działamy już na
+danych tylko z 2024 roku)
+
+```{r}
+df %>%
+  group_by(date = as.Date(datetime)) %>%
+  summarise(total = sum(total)) %>%
+  mutate(wday = factor(wday(date, week_start = 1))) %>%
+  ggplot(aes(x = wday, y = total, fill = after_scale(x))) +
+  geom_violin() +
+  geom_boxplot(alpha=0.5, width=0.3) +
+  labs(
+    x = "Dzień tygodnia",
+    y = "Przychód",
+    title = "Przychód w różne dni tygodnia"
+  ) +
+  scale_x_discrete(labels = c(
+    "Poniedziałek",
+    "Wtorek",
+    "Środa",
+    "Czwartek",
+    "Piątek",
+    "Sobota",
+    "Niedziela"
+  )) +
+  theme_light()
+```
+
+Obserwujemy obniżenie sprzedaży w poniedziałek. Mamy na to wyjaśnienie z
+rzeczywistości. Obok tego sklepu znajduje się targ który jest nieczynny w
+poniedziałek. Duża część klientów naszego sklepu są także klientami targu, a
+więc przy zamknięciu ostatniego sukces dzienny maleje.
+
+Z innej strony w weekendy mamy o wiele lepsze wyniki dlatego, że ludzie
+naturalnie chodzą na zakupy częściej w dni wolne od pracy.
+
+### Pory dnia
+
+Podzielmy teraz każdy dzień na trzy pory --- rano, dzień, wieczór. Żeby
+przekonać się, że ma to sens, spójrzmy na wykres słupkowy dla średnich przychodu
+w każdej godzinie otwarcia sklepu:
+
+```{r}
+df %>%
+  group_by(hour = format(ceiling_date(datetime, unit = "1 hour"),
+    format = "%H:%M"
+  )) %>%
+  summarise(total = sum(total)) %>%
+  ggplot(aes(x = hour, y = total)) +
+  geom_col(fill = "#A870DB") +
+  labs(
+    x = "Godzina",
+    y = "Łączny przychód zdobyty w tych godzinach",
+    title = "Łączna kwota paragonów w każdej godzinie"
+  ) +
+  theme_light()
+```
+
+Na prawach subiektywnej decyzji badacza przypisujemy obserwacjom czas doby:
+
+- Rano: `morning` -- $t \in [0, 11)$
+- Dzień: `day` -- $t \in [11, 16)$
+- Wieczór: `afternoon` -- $t \in [16, 24)$
+
+```{r}
+#| include: false
+df <- df %>%
+  mutate(
+    hour = hour(datetime),
+    time_of_day = factor(case_when(
+      hour >= 0 & hour < 11 ~ "morning",
+      hour >= 11 & hour < 16 ~ "day",
+      TRUE ~ "afternoon"
+    ), levels = c("morning", "day", "afternoon")),
+    hour = NULL,
+  )
+
+df_shellings_timely <- df %>%
+  mutate(date = as.Date(datetime)) %>%
+  group_by(time_of_day, date) %>%
+  summarise(
+    diff = difftime(max(datetime), min(datetime), unit = "mins"),
+    total = sum(total),
+    total.weight = total / ifelse(as.numeric(diff) != 0, as.numeric(diff), 1),
+    temperature_2m = mean(temperature_2m),
+    precipitation = sum(precipitation),
+    visibility = mean(visibility)
+  ) %>%
+  left_join(., shellings) %>%
+  mutate(across(everything(), ~ replace_na(., 0)))
+sum(is.na(df_shellings_timely))
+```
+
+# Metody statystyczne
+
+## Karta vs. gotówka
+
+Zbadajmy najpierw czy kartą płacą więcej niż gotówka. Według doświadczenia
+własnego właścicielki sklepu po zainstalowaniu terminala płatniczego, średnia
+kwota paragonu wyrosła. Zobaczmy więc co mówią dane
+
+```{r}
+df %>%
+  group_by(day = month(datetime), payment) %>%
+  summarise(total = sum(total), .groups = "drop") %>%
+  ggplot(aes(x = payment, fill = payment, y = total)) +
+  geom_violin() +
+  geom_boxplot(width=0.3, alpha=0.5) +
+  theme_light() +
+  labs(
+    x = "Płatność",
+    y = "Łączny miesięczny przychód",
+    title = "Przychód z różnych form płatności"
+  ) +
+  scale_x_discrete(labels = c("Karta", "Gotówka")) +
+  theme(legend.position = "none")
+```
+Obserwujemy istotną różnicę w kwotach zapłaconych kartą i gotówką. Sprawdźmy to
+za pomocą testu t-Studenta. Najpierw sprawdzamy za pomocą testu Shapiro-Wilka
+czy spełnione jest założenie tego testu -- normalność rozkładów w
+obu grupach.
+
+```{r}
+df_payments <- df %>%
+  group_by(date = as.Date(datetime)) %>%
+  summarise(
+    card = sum(ifelse(payment == "Card", total, 0)),
+    cash = sum(ifelse(payment == "Cash", total, 0))
+  )
+
+gotowka <- df_payments$cash
+karta <- df_payments$card
+
+karta.shapiro <- shapiro.test(karta)
+gotowka.shapiro <- shapiro.test(gotowka)
+```
+
+Stawiamy hipotezy:
+
+- $H_0$: rozkład kwoty płatności kartą (gotówką) jest normalny
+- $H_1$: rozkład tej cechy jest inny niż normalny
+
+Dla obu testów otrzymano p-wartość mniejszą od dowolnego rozsądnie przyjętego
+poziomu istotności: `r format_numbers(karta.shapiro$p.value, digits = 2, format = "sci")`
+i `r format_numbers(gotowka.shapiro$p.value, digits = 2, format = "sci")`
+odpowiednio dla karty i gotówki. Odrzucamy hipotezę zerową -- **rozkład obu cech
+jest inny niż normalny**. Jednak ze względu na to że mamy odpowiednio dużą próbę
+(`r length(karta)` obserwacji), pozwolimy sobie na przeprowadzenie testu mimo
+nie spełnionego założenia.
+
+---
+
+Dalej sprawdzamy czy wariancje są równe w grupach
+
+```{r}
+vartest.kar.got <- var.test(karta, gotowka)
+```
+
+$$
+  H_0: \sigma_k = \sigma_g \quad
+  \text{vs} \quad
+  H_1: \sigma_k \ne \sigma_g
+$$
+
+
+p-wartość jest równa `r vartest.kar.got$p.value`. Odrzucamy $H_0$ -- wariancje
+są różne. Wobec tego skorzystajmy z testu t-Welch'a, który jest odporny na
+różność wariancji
+
+```{r}
+card.cash.ttest <- t.test(karta, gotowka, alternative = "greater")
+```
+
+---
+
+Stawiamy hipotezy:
+$$
+  H_0: \mu_k = \mu_g \quad
+  \text{vs} \quad
+  H_1: \mu_k > \mu_g
+$$
+
+gdzie $\mu_k$ i $\mu_g$ to średnie rozkładu łącznego dziennego przychodu poprzez
+odpowiednio zapłatę kartą i gotówką
+
+Otrzymano p-wartóść równą `r format_numbers(card.cash.ttest$p.value, digits = 2, format = "sci")`,
+więc odrzucamy hipotezę zerową na korzyść hipotezy alternatywnej -- **kartą
+średnio dziennie płacą więcej niż gotówką**.
+
+---
+
+Dodatkowo zbudowano przedział ufności dla różnicy $\mu_k - \mu_g$ na poziomie
+ufności `r attr(card.cash.ttest$conf.int, "conf.level")` równy
+$$
+[`r card.cash.ttest$conf.int[1]` ; \; +\infty )
+$$
+Przedział ten nie zawiera zera oraz jego lewy koniec jest dodatni, co potwierdza
+powyższy wniosek.
+
+## Pory dnia
+
+Czy sukces sprzedaży jest zależny od czasu doby? Spróbujmy odpowiedzieć na to
+pytanie. Zobaczmy jak się rozkłada przychód w skali miesiąca w zależności od
+[ustalonych wcześniej](#pory-dnia) pór doby. Bierzemy miesiąc dlatego że
+wcześniej widzieliśmy wyraźną różnicę w przychodzie w różnych miesiącach, a więc
+musimy ją uwzględnić. Naszkicujmy najpierw wykresy reprezentujące tę zależność.
+
+```{r}
+df_shellings_timely %>%
+  group_by(month = month(date), time_of_day) %>%
+  summarise(
+    total.weight = sum(total.weight),
+    total = sum(total),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = time_of_day, fill = time_of_day, y = total.weight)) +
+  geom_violin() +
+  geom_boxplot(alpha=0.5, width=0.3) +
+  theme_light() +
+  labs(
+    x = "Czas doby",
+    y = "Łączny przychód/godzinę miesięcznie",
+    title = "Przeskalowany w zależności od czasu doby"
+  ) +
+  scale_x_discrete(labels = c("Rano", "Dzień", "Wieczór")) +
+  theme(legend.position = "none")
+```
+
+## Róznica w dniach tygodnia
+
+Rozważmy teraz trzy grupy: poniedziałek, wtorek-piątek, sobota-niedziela. Z
+[wykresu](#dzień-tygodnia) możemy przypuścić, że średnie przychodu w tych
+grupach istotnie się różnią. Ponieważ nie mamy normalności w żadnej z grup,
+przeprowadzimy odporny na to test Kruskala-Wallisa. Jest to test
+nieparametryczny z hipotezami:
+
+
+$$
+  H_0: F_1 = F_2 = F_3 = F \quad \text{vs} \quad
+  H_1: \bigvee_{\substack{i, j \in \{1, 2, 3\}\\ i\ne j}} F_i \ne F_j
+$$
+
+gdzie $F_i$ -- dystrybuanta rozkładu przychodu w $i$-tej grupie
+
+```{r}
+wday.groups <- df_shellings_daily %>%
+  mutate(group = factor(case_match(
+    wday(date, week_start = 1),
+    1 ~ 1,
+    2:5 ~ 2,
+    6:7 ~ 3
+  ))) %>%
+  select(total, group)
+kruskal <- kruskal.test(total ~ group, data = wday.groups)
+```
+
+Otrzymano p-wartość równą `r format_numbers(kruskal$p.value, digits = 2, format = "sci")`,
+co oznacza że musimy odrzucić $H_0$ -- **istnieje statystycznie istotna różnica
+między rozkładami przychodu w grupach**.
+
+---
+
+Przeprowadzamy też testy Welch'a post-hoc, dla każdej pary grup. W każdym
+przypadku odrzucamy hipotezę zerową o równości średnich, co oznacza, że **każda
+z tych par jest statystycznie istotnie zróżnicowana** ze względu na cechę
+przychód. Budujemy też przedziały ufności dla średniej w każdej z grup.
+Sprawdzamy najpierw normalność w grupach -- od tego zależeć będzie jakiego wzoru
+na przedział ufności należy użyć.
+
+```{r}
+normality.groups <- wday.groups %>%
+  group_by(group) %>%
+  group_map(~shapiro.test(.$total)$p.value) %>%
+  as.data.frame() %>%
+  t()
+rownames(normality.groups) <- c("Poniedziałek", "Wtorek-Piątek",
+                                "Sobota-Niedziela")
+colnames(normality.groups) <- c("p-wartość")
+kable(normality.groups,
+      caption = "Wyniki testów Shapiro-Wilka w grupach")
+```
+
+Widzimy, że w każdej z grup odrzucamy hipotezę zerową o tym, że rozkład
+przychodu jest normalny. Skorzystano więc z przedziałów odpornych na naruszenie
+normalności rozkładu:
+$$
+(\overline{x} - u_{1 - \frac{\alpha}{2}}\frac{\hat{s}}{\sqrt{n}}, \;
+\overline{x} - u_{1 + \frac{\alpha}{2}}\frac{\hat{s}}{\sqrt{n}})
+$$
+
+```{r}
+#| include: false
+t.test(filter(wday.groups, group == 1)$total,
+       filter(wday.groups, group == 2)$total)
+t.test(filter(wday.groups, group == 1)$total,
+       filter(wday.groups, group == 3)$total)
+t.test(filter(wday.groups, group == 2)$total,
+       filter(wday.groups, group == 3)$total)
+```
+
+```{r}
+#| include: false
+wday.groups %>%
+  group_by(group) %>%
+  group_map(~shapiro.test(.$total))
+```
+
+```{r}
+summary_df <- wday.groups %>%
+  group_by(group) %>%
+  summarise(
+    mean = mean(total),
+    se = sd(total) / sqrt(n()),
+    lower = mean - qnorm(0.975) * se,
+    upper = mean + qnorm(0.975) * se
+  )
+
+ggplot(summary_df, aes(x = factor(group), y = mean)) +
+  geom_col(aes(fill = factor(group))) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.15, color = "black") +
+  labs(
+    x = "Grupa",
+    y = "95% przedział ufności średniego dziennego przychodu",
+    title = "Przedziały ufności dla średniej według dnia tygodnia"
+  ) +
+  scale_x_discrete(labels = c(
+    "Poniedziałek",
+    "Wtorek–Piątek",
+    "Sobota–Niedziela"
+  )) +
+  theme_light() +
+  theme(legend.position = "none")
+```
+<!-- Automatize and make all the figures labeled automatically  -->
+
+## Badanie korelacji
+
+Przejdźmy teraz do wyjaśnienia tych wariancji przychodu, które wcześniej
+odkryliśmy. Zobaczmy jaka jest korelacja dostępnych cech ilościowych
+
+```{r}
+PerformanceAnalytics::chart.Correlation(
+  select_if(df_shellings_daily, ~is.numeric(.)),
+  histogram = FALSE
+)
+```
+
+Widzimy wiele istotnych korelacji, niemniej jednak **`total` nie jest
+skorelowana z żadną inną cechą oprócz temperatury**. W teorii związane jest to z
+tym, że nie uwzględniliśmy w analizie korelacji związku przychodu z dniem
+tygodnia oraz czynnikami informacji o których nie posiadamy.
+
+
+# Modele liniowe
+
+### Model przychodu względem pozostałych cech {#model-total}
+
+<!-- The best we have yet -->
+```{r}
+#| include: false
+df_model = df_shellings_daily%>%
+  mutate(month = factor(month(date)),
+         shellings = count!=0)%>%
+  select(-c(date, diff))
+
+mf = lm(formula = total~., data = df_model)
+me = lm(formula = total~1, data = df_model)
+
+best.lm.total <- step(mf, me)
+
+plot(best.lm.total, which = 1)
+summary(best.lm.total)
+```
+
+Doboru zmiennych do modelu dokonano metodą regresji krokowej. Zaczęto od modelu
+pustego, decyzję podejmowano na podstawie kryterium informacyjnego Akaike.
+Otrzymano model postaci:
+
+```{r}
+formula(best.lm.total)
+```
+
+Wszystkie współczynniki tego modelu są statystycznie istotne (przy przyjętym
+poziomie istotności $\alpha = 0.01$) oraz poprawiony współczynnik determinacji
+jest równy:
+
+$$
+R^2_{\text{adj}} \approx `r summary(best.lm.total)$adj.r.squared |> round(3)`
+$$
+Czyli model **wyjaśnia około `r round(summary(best.lm.total)$adj.r.squared*100, 0)`%
+wariancji przychodu.** Nie jest to zadowalający wynik, ale jest on najlepszy
+z osiągalnych pod warunkiem danych które posiadamy.
+
+Zwizualizujmy jeszcze korelację pomiędzy zmiennymi ilościowymi w otrzymanym modelu:
+
+```{r}
+PerformanceAnalytics::chart.Correlation(
+  select(df_model, total,temperature_2m, Injured, count, length, shellings),
+  histogram = FALSE)
+```
+
+Istotnie skorelowane ze zmienną objaśnianą są tylko `temperature_2m` oraz
+`shellings`
+
+
+### Model regresji logitowej
+
+Spróbujmy teraz przewidzieć prawdopodobieństwo wystąpienia ostrzału w danym dniu
+na podstawie obecnych danych. Budujemy w tym celu model regresji logitowej z
+dychotomiczną zmienną objaśnianą `shellings`:
+
+$$
+\text{shellings} =
+    \begin{cases}
+    1, & \text{count} >0\\
+    0, & \text{count} = 0
+    \end{cases}
+$$
+
+```{r}
+#| include: false
+model.shellings <- glm(
+  data = df_model,
+  family = "binomial",
+  formula = shellings ~ length + visibility + surface_pressure + alarms_mean
+)
+summary(model.shellings)
+```
+
+Zbudowany model jest postaci:
+
+```{r}
+formula(model.shellings)
+```
+
+Obliczamy powszechnie używane do walidacji modeli logitowych współczynniki
+pseudo $R^2$:
+
+```{r}
+kable(t(DescTools::PseudoR2(model.shellings,
+                    which = c("McFadden",
+                              "CoxSnell",
+                              "Nagelkerke",
+                              "Efron"))))
+```
+
+Tylko współczynnik McFadden'a mieści się w zalecanym przedziale $(0.2,\, 0.4)$ z
+czego wnioskujemy, że model nie jest za dobrze dopasowany do danych. Ponieważ
+jest to model klasyfikacyjny, możemy zbudować macierz kontyngencji przy
+przyjętym progu odcięcia $\tau = 0.5$:
+
+```{r}
+conf <- DescTools::Conf(model.shellings,
+                        cutoff = 0.5)
+fourfoldplot(conf$table, color = c("#CC6666", "#99CC99"),
+             conf.level = 0, margin = 1, main = "Macierz kontyngencji")
+```
+
+Obliczamy na podstawie tej macierzy też podstawowe miary:
+
+```{r}
+miary <- data.frame(matrix(c(
+  "Dokładność", round(conf$acc, 3), # dokładność
+  "Czułość",    round(conf$byclass[1], 3), # czułość
+  "Swoistość",  round(conf$byclass[2], 3), # swoistość
+  "Precyzja",   round(conf$byclass[3], 3) # precyzja
+), byrow = TRUE, ncol = 2))
+kableExtra::kable(miary, col.names = NULL, caption = "Podstawowe miary modelu")
+```
+
+Wysoka wartość dokładności wskazuje na to, że większość obserwacji model
+**sklasyfikował poprawnie** , a swoistości -- na to, że model wychwytuje
+większość dni w których **nie** było ostrzałów. Wówczas czułość jest za niska,
+co oznacza że model **nie jest dobry**  w predykcji dni w których ostrzały
+wystąpią. Precyzja jest na przeciętnym poziomie, tzn ze wszystkich dni, dla
+których model przewidział ostrzał, blisko **3 na 4 faktycznie go miały** .
+
+# Podsumowanie
+
+Z badań statystycznych możemy wywnioskować:
+
+- Dzienny przychód z opłat kartą jest większy niż z opłat gotówką.
+- Sukces sprzedaży zależy od dnia tygodnia, przy czym w poniedziałek jest
+  "gorzej" niż od wtorku do piątku; wtedy z kolei jest "gorzej" niż w sobotę i
+  niedzielę.
+- Wysokość przychodu zależy też od pory doby: przychód w dniu < rano <
+  wieczorem.
+- Sprzedaż jest skorelowana z temperaturą, wilgotnością a ciśnieniem (pod
+  warunkiem posiadania tylko danych wykorzystanych w projekcie). Zmienne te, a
+  także kilka innych (patrz [Model przychodu względem pozostałych cech])
+  istotnie wpływają na sprzedaż, ale ich nie wystarczyło, by wyjaśnić w pełni
+  wariancji zmiennej objaśnianej. Najprawdopodobniej wpływają na nią jeszcze
+  jakieś zmienne, informacji o których niestety nie posiadamy.
+- Długość alarmów powietrznych zależy od widoczności a temperatury. Jednak model
+  regresji logitowej mający na celu wyjaśnić występowanie ostrzałów mimo dobrej
+  mocy przywidywania braku ostrzałów, nie jest dobry do wykazywania ich
+  obecności.
+
+Podjęta próba wyjaśnienia zachowań w tych danych okazała się częściowo
+skuteczna; w niektórych obszarach napotkaliśmy trudności, a w innych
+prawdopodobnie szukaliśmy zależności, które w rzeczywistości nie występują.
+
+>If you torture the data long enough, it will confess to anything
+>
+>Ronald H. Coase
